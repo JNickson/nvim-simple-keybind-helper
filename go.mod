@@ -1,4 +1,4 @@
-module github.com/JNickson/nvim-helper
+module github.com/JNickson/nvim-simple-keybind-helper
 
 go 1.25.5
 
