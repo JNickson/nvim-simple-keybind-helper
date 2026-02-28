@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -27,6 +30,23 @@ type model struct {
 	allRows    []table.Row
 	search     textinput.Model
 	searchMode bool
+}
+
+type columnConfig struct {
+	Title string `json:"title"`
+	Width int    `json:"width"`
+}
+
+type rowConfig struct {
+	Mode    string `json:"mode"`
+	Keybind string `json:"keybind"`
+	Action  string `json:"action"`
+}
+
+type appConfig struct {
+	Columns []columnConfig `json:"columns"`
+	Rows    []rowConfig    `json:"rows"`
+	Height  int            `json:"height"`
 }
 
 func (m model) Init() tea.Cmd {
@@ -133,81 +153,173 @@ func (m model) View() string {
 	return tableView + "\n\n" + helpLine + "\n"
 }
 
+func defaultConfig() appConfig {
+	return appConfig{
+		Columns: []columnConfig{
+			{Title: "Mode", Width: 8},
+			{Title: "Keybind", Width: 16},
+			{Title: "Action", Width: 80},
+		},
+		Rows: []rowConfig{
+			// Visual
+			{Mode: "visual", Keybind: "y", Action: "yank (copy) selection"},
+			{Mode: "visual", Keybind: ">", Action: "indent selection right"},
+			{Mode: "visual", Keybind: "<", Action: "indent selection left"},
+
+			// Insert
+			{Mode: "insert", Keybind: "<C-h>", Action: "delete previous character"},
+			{Mode: "insert", Keybind: "<C-w>", Action: "delete all from the cursor back to  word boundary (space or punctuation)"},
+			{Mode: "insert", Keybind: "<C-c>", Action: "exit insert mode"},
+			{Mode: "insert", Keybind: "<Esc>", Action: "exit insert mode"},
+
+			// Normal - Movement
+			{Mode: "normal", Keybind: "5h 20j 3k 4l", Action: "move cursor left/down/up/right by amount"},
+			{Mode: "normal", Keybind: "h j k l", Action: "move cursor left/down/up/right"},
+			{Mode: "normal", Keybind: "w", Action: "move to next word"},
+			{Mode: "normal", Keybind: "b", Action: "move to previous word"},
+			{Mode: "normal", Keybind: "gg", Action: "go to top of file"},
+			{Mode: "normal", Keybind: "G", Action: "go to bottom of file"},
+			{Mode: "normal", Keybind: "0", Action: "go to beginning of line"},
+			{Mode: "normal", Keybind: "$", Action: "go to end of line"},
+			{Mode: "normal", Keybind: "<C-f>", Action: "page down and centre, we added zz"},
+			{Mode: "normal", Keybind: "<C-b>", Action: "page up and centre, we added zz"},
+
+			// Normal - Editing
+			{Mode: "normal", Keybind: "dd", Action: "delete (cut) current line"},
+			{Mode: "normal", Keybind: "yy", Action: "yank current line"},
+			{Mode: "normal", Keybind: "<S-P>", Action: "paste clipboard"},
+			{Mode: "normal", Keybind: "p", Action: "paste after cursor"},
+			{Mode: "normal", Keybind: "u", Action: "undo last change"},
+			{Mode: "normal", Keybind: "<C-r>", Action: "redo last undone change"},
+
+			// Normal - Search
+			{Mode: "normal", Keybind: "/", Action: "search forward"},
+			{Mode: "normal", Keybind: "?", Action: "search backward"},
+			{Mode: "normal", Keybind: "n", Action: "next search match (need to use / or ? before hand)"},
+			{Mode: "normal", Keybind: "N", Action: "previous search match (need to use / or ? before hand)"},
+
+			// Normal - LSP (if configured)
+			{Mode: "normal", Keybind: "<C-o>", Action: "jump back from jump list (anything that moves the cursor counts as this)"},
+			{Mode: "normal", Keybind: "<C-i>", Action: "jump forward in jump list (anything that moves the cursor counts as this)"},
+			{Mode: "normal", Keybind: "gd", Action: "go to definition (LSP if attached)"},
+			{Mode: "normal", Keybind: "grr", Action: "show references (LSP)"},
+			{Mode: "normal", Keybind: "K", Action: "hover documentation (LSP or man page)"},
+
+			// Your custom ones
+			{Mode: "normal", Keybind: "<leader>h", Action: "open harpoon menu"},
+			{Mode: "normal", Keybind: "<leader>a", Action: "append current file to harpoon"},
+			{Mode: "normal", Keybind: "<leader>fo", Action: "format and organize imports"},
+			{Mode: "normal", Keybind: "<leader>ff", Action: "find file in project"},
+			{Mode: "normal", Keybind: "di\"", Action: "delete inside current double quotes"},
+			{Mode: "normal", Keybind: "da\"", Action: "delete around current double quotes (including quotes)"},
+
+			{Mode: "normal", Keybind: "dw", Action: "delete from cursor to start of next word"},
+			{Mode: "normal", Keybind: "db", Action: "delete from cursor to start of previous word"},
+
+			{Mode: "normal", Keybind: "diw", Action: "delete inner word (current word only)"},
+			{Mode: "normal", Keybind: "daw", Action: "delete around word (word plus surrounding space)"},
+
+			{Mode: "normal", Keybind: "ciw", Action: "change inner word (delete current word, and puts in insert mode)"},
+			{Mode: "normal", Keybind: "yiw", Action: "yank inner word"},
+
+			{Mode: "normal", Keybind: "di(", Action: "delete inside parentheses"},
+			{Mode: "normal", Keybind: "da(", Action: "delete around parentheses"},
+		},
+		Height: 7,
+	}
+}
+
+func resolveConfigPath(args []string, envValue string) (string, error) {
+	flags := flag.NewFlagSet("nvim-simple-keybind-helper", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+
+	configPathFlag := flags.String("config", "", "path to JSON config file")
+	if err := flags.Parse(args); err != nil {
+		return "", err
+	}
+
+	if path := strings.TrimSpace(*configPathFlag); path != "" {
+		return path, nil
+	}
+
+	return strings.TrimSpace(envValue), nil
+}
+
+func loadConfig(path string) (appConfig, error) {
+	defaultCfg := defaultConfig()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return appConfig{}, err
+	}
+
+	var cfg appConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return appConfig{}, err
+	}
+
+	if len(cfg.Columns) == 0 {
+		cfg.Columns = defaultCfg.Columns
+	}
+
+	if cfg.Height <= 0 {
+		cfg.Height = defaultCfg.Height
+	}
+
+	if cfg.Rows == nil {
+		cfg.Rows = []rowConfig{}
+	}
+
+	return cfg, nil
+}
+
+func configColumnsToTableColumns(columns []columnConfig) []table.Column {
+	tableColumns := make([]table.Column, 0, len(columns))
+
+	for _, column := range columns {
+		tableColumns = append(tableColumns, table.Column{Title: column.Title, Width: column.Width})
+	}
+
+	return tableColumns
+}
+
+func configRowsToTableRows(rows []rowConfig) []table.Row {
+	tableRows := make([]table.Row, 0, len(rows))
+
+	for _, row := range rows {
+		tableRows = append(tableRows, table.Row{row.Mode, row.Keybind, row.Action})
+	}
+
+	return tableRows
+}
+
 func main() {
-	columns := []table.Column{
-		{Title: "Mode", Width: 8},
-		{Title: "Keybind", Width: 16},
-		{Title: "Action", Width: 80},
+	cfg := defaultConfig()
+
+	configPath, err := resolveConfigPath(os.Args[1:], os.Getenv("NVIM_HELPER_CONFIG"))
+	if err != nil {
+		fmt.Printf("Error parsing flags: %v\n", err)
+		os.Exit(1)
 	}
 
-	rows := []table.Row{
-		// Visual
-		{"visual", "y", "yank (copy) selection"},
-		{"visual", ">", "indent selection right"},
-		{"visual", "<", "indent selection left"},
+	if configPath != "" {
+		loadedCfg, err := loadConfig(configPath)
+		if err != nil {
+			fmt.Printf("Error loading config from %s: %v\n", configPath, err)
+			os.Exit(1)
+		}
 
-		// Insert
-		{"insert", "<C-h>", "delete previous character"},
-		{"insert", "<C-w>", "delete all from the cursor back to  word boundary (space or punctuation)"},
-		{"insert", "<C-c>", "exit insert mode"},
-		{"insert", "<Esc>", "exit insert mode"},
-
-		// Normal - Movement
-		{"normal", "5h 20j 3k 4l", "move cursor left/down/up/right by amount"},
-		{"normal", "h j k l", "move cursor left/down/up/right"},
-		{"normal", "w", "move to next word"},
-		{"normal", "b", "move to previous word"},
-		{"normal", "gg", "go to top of file"},
-		{"normal", "G", "go to bottom of file"},
-		{"normal", "0", "go to beginning of line"},
-		{"normal", "$", "go to end of line"},
-
-		// Normal - Editing
-		{"normal", "dd", "delete (cut) current line"},
-		{"normal", "yy", "yank current line"},
-		{"normal", "<S-P>", "paste clipboard"},
-		{"normal", "p", "paste after cursor"},
-		{"normal", "u", "undo last change"},
-		{"normal", "<C-r>", "redo last undone change"},
-
-		// Normal - Search
-		{"normal", "/", "search forward"},
-		{"normal", "?", "search backward"},
-		{"normal", "n", "next search match (need to use / or ? before hand)"},
-		{"normal", "N", "previous search match (need to use / or ? before hand)"},
-
-		// Normal - LSP (if configured)
-		{"normal", "<C-o>", "jump back from jump list (anything that moves the cursor counts as this)"},
-		{"normal", "<C-i>", "jump forward in jump list (anything that moves the cursor counts as this)"},
-		{"normal", "gd", "go to definition (LSP if attached)"},
-		{"normal", "grr", "show references (LSP)"},
-		{"normal", "K", "hover documentation (LSP or man page)"},
-
-		// Your custom ones
-		{"normal", "<leader>h", "open harpoon menu"},
-		{"normal", "<leader>a", "append current file to harpoon"},
-		{"normal", "<leader>fo", "format and organize imports"},
-		{"normal", "<leader>ff", "find file in project"},
-		{"normal", "di\"", "delete inside current double quotes"},
-		{"normal", "da\"", "delete around current double quotes (including quotes)"},
-
-		{"normal", "dw", "delete from cursor to start of next word"},
-		{"normal", "db", "delete from cursor to start of previous word"},
-
-		{"normal", "diw", "delete inner word (current word only)"},
-		{"normal", "daw", "delete around word (word plus surrounding space)"},
-
-		{"normal", "ciw", "change inner word (delete current word, and puts in insert mode)"},
-		{"normal", "yiw", "yank inner word"},
-
-		{"normal", "di(", "delete inside parentheses"},
-		{"normal", "da(", "delete around parentheses"},
+		cfg = loadedCfg
 	}
+
+	columns := configColumnsToTableColumns(cfg.Columns)
+	rows := configRowsToTableRows(cfg.Rows)
+
 	t := table.New(
 		table.WithColumns(columns),
 		table.WithRows(rows),
 		table.WithFocused(true),
-		table.WithHeight(7),
+		table.WithHeight(cfg.Height),
 	)
 
 	s := table.DefaultStyles()
